@@ -6,44 +6,57 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/bytecodealliance/wasmtime-go/v32"
 	"github.com/jackc/puddle/v2"
-	"github.com/tetratelabs/wazero"
-	"github.com/tetratelabs/wazero/api"
 )
 
-func constructor(ctx context.Context) (api.Module, error) {
-
+func constructor(ctx context.Context) (*StoreInstance, error) {
 	id, err := randomIdentifier()
-
 	if err != nil {
 		return nil, fmt.Errorf("error generating random id for wasm module: %w", err)
 	}
 
 	idStr := strconv.Itoa(int(id))
 
-	module, err := runtime.InstantiateModule(ctx, compiled, wazero.NewModuleConfig().WithName(idStr))
+	store := wasmtime.NewStore(engine)
 
+	wasiConfig := wasmtime.NewWasiConfig()
+	wasiConfig.InheritStdin()
+	wasiConfig.InheritStdout()
+	wasiConfig.InheritStderr()
+	store.SetWasi(wasiConfig)
+
+	instance, err := linker.Instantiate(store, wasmModule)
 	if err != nil {
-		return nil, fmt.Errorf("error instantiating wasm module: %w", err)
+		return nil, fmt.Errorf("error instantiating wasm module %s: %w", idStr, err)
 	}
 
-	return module, nil
+	memory := instance.GetExport(store, "memory").Memory()
+	if memory == nil {
+		return nil, fmt.Errorf("memory not found in wasm module %s", idStr)
+	}
+
+	return &StoreInstance{
+		Store:    store,
+		Instance: instance,
+		Memory:   memory,
+	}, nil
 }
 
-func destructor(module api.Module) {
-	_ = module.Close(context.Background()) // Not possible to deal with this error
+func destructor(si *StoreInstance) {
 }
 
-func newResourcePool(maxSize int32) (*puddle.Pool[api.Module], error) {
-	//pool := puddle.NewPool(constructor, destructor, maxSize)
-	pool, err := puddle.NewPool(&puddle.Config[api.Module]{Constructor: constructor, Destructor: destructor, MaxSize: maxSize})
-
+func newResourcePool(maxSize int32) (*puddle.Pool[*StoreInstance], error) {
+	pool, err := puddle.NewPool(&puddle.Config[*StoreInstance]{
+		Constructor: constructor,
+		Destructor:  destructor,
+		MaxSize:     maxSize,
+	})
 	if err != nil {
 		return pool, fmt.Errorf("error creating resource pool: %w", err)
 	}
 
 	err = pool.CreateResource(context.Background())
-
 	if err != nil {
 		return pool, fmt.Errorf("error prewarming resource pool: %w", err)
 	}
@@ -51,41 +64,37 @@ func newResourcePool(maxSize int32) (*puddle.Pool[api.Module], error) {
 	return pool, nil
 }
 
-func periodicallyRemoveIdleResources(pool *puddle.Pool[api.Module]) {
-
+func periodicallyRemoveIdleResources(pool *puddle.Pool[*StoreInstance]) {
 	duration := 2 * time.Second
 	ticker := time.NewTicker(duration)
 
-	for {
-		select {
-		case <-ticker.C:
-			stats := pool.Stat()
+	for range ticker.C {
+		stats := pool.Stat()
 
-			if stats.TotalResources() <= 1 {
-				continue
-			}
+		if stats.TotalResources() <= 1 {
+			continue
+		}
 
-			idleResources := pool.AcquireAllIdle()
-			numIdleResources := len(idleResources)
+		idleResources := pool.AcquireAllIdle()
+		numIdleResources := len(idleResources)
 
-			if numIdleResources <= 0 {
-				continue
-			}
+		if numIdleResources <= 0 {
+			continue
+		}
 
-			max := int(stats.TotalResources())
+		max := int(stats.TotalResources())
 
-			amountToKill := numIdleResources
+		amountToKill := numIdleResources
 
-			if numIdleResources >= max {
-				amountToKill = numIdleResources - 1
-			}
+		if numIdleResources >= max {
+			amountToKill = numIdleResources - 1
+		}
 
-			for i := 0; i < numIdleResources; i++ {
-				if i >= amountToKill {
-					idleResources[i].Release()
-				} else {
-					idleResources[i].Destroy()
-				}
+		for i := 0; i < numIdleResources; i++ {
+			if i >= amountToKill {
+				idleResources[i].Release()
+			} else {
+				idleResources[i].Destroy()
 			}
 		}
 	}
